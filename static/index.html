@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>repo-finder</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img class="logo" src="/favicon.svg" alt="" aria-hidden="true">
+      <span class="name">repo-finder</span>
+      <span class="badge debug" id="debug-badge" hidden>debug</span>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab active" role="tab" data-tab="workspace">Workspace</button>
+      <button class="tab" role="tab" data-tab="report">Report</button>
+      <button class="tab" role="tab" data-tab="profile">Profile</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- Workspace -->
+    <section class="panel" id="tab-workspace">
+      <div class="card">
+        <div class="card-head"><h3>Incoming jobs</h3><span class="muted small" id="msg-count"></span></div>
+        <div id="messages" class="list"><p class="empty">No jobs yet. They appear here once the server sends them.</p></div>
+      </div>
+    </section>
+
+    <!-- Report -->
+    <section class="panel" id="tab-report" hidden>
+      <div class="stats">
+        <div class="stat"><div class="stat-v" id="s-pings">0</div><div class="stat-k">Registrations sent</div></div>
+        <div class="stat"><div class="stat-v" id="s-polls">0</div><div class="stat-k">Server polls</div></div>
+        <div class="stat"><div class="stat-v" id="s-messages">0</div><div class="stat-k">Messages received</div></div>
+        <div class="stat"><div class="stat-v" id="s-errors">0</div><div class="stat-k">Errors</div></div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h3>Activity log</h3><button class="btn small ghost" id="clear-btn">Clear</button></div>
+        <div id="log" class="list log"></div>
+      </div>
+      <div class="card" id="debug-card" hidden>
+        <div class="card-head"><h3>Last server response</h3><span class="muted small">debug</span></div>
+        <pre id="last-response">—</pre>
+      </div>
+    </section>
+
+    <!-- Profile -->
+    <section class="panel" id="tab-profile" hidden>
+      <div class="card status-card collapsible" id="card-registration">
+        <div class="status-head">
+          <div>
+            <div class="eyebrow">Server connection</div>
+            <h2 id="status-title">Not registered</h2>
+            <p class="muted" id="status-text">This worker has not asked the server to join yet.</p>
+          </div>
+          <div class="head-tools"><span class="pill" id="status-pill">unregistered</span></div>
+        </div>
+
+        <div class="alert warn" id="channel-warning" hidden>
+          <strong>Channel is not allocated yet.</strong>
+          The server has enrolled this worker but has not put it in a channel. It will start working as soon as one is allocated.
+        </div>
+        <div class="alert error" id="error-box" hidden></div>
+
+        <ol class="steps" id="steps">
+          <li data-step="request">Registration sent</li>
+          <li data-step="approved">Approved &amp; ID allocated</li>
+          <li data-step="channel">Channel allocated</li>
+        </ol>
+
+        <dl class="facts">
+          <div><dt>Server</dt><dd id="f-server">—</dd></div>
+          <div><dt>Enrolled ID</dt><dd><code id="f-id">—</code></dd></div>
+          <div><dt>Channels</dt><dd id="f-channels">—</dd></div>
+          <div><dt>Last contact</dt><dd id="f-contact">—</dd></div>
+        </dl>
+
+        <div class="actions">
+          <button class="btn primary" id="register-btn">Register to server</button>
+          <button class="btn ghost" id="forget-btn" hidden>Forget registration</button>
+        </div>
+      </div>
+
+      <form class="card collapsible" id="profile-form">
+        <div class="card-head">
+          <div><h3>Worker profile</h3><div class="summary muted small" id="sum-profile"></div></div>
+          <div class="head-tools"></div>
+        </div>
+        <label>Name <span class="muted small">— how the server lists this worker</span>
+          <input name="name" required pattern="[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}">
+        </label>
+        <label>Label <span class="muted small">— optional note shown to the approver</span>
+          <input name="label">
+        </label>
+        <label>Server URL
+          <input name="server_url" type="url" required>
+        </label>
+        <p class="muted small" id="profile-lock" hidden>Name and server can't change while registered. Forget the registration first.</p>
+        <div class="actions"><button class="btn primary" type="submit">Save</button><span class="muted small" id="saved-note"></span></div>
+      </form>
+      <div class="card collapsible" id="card-identity">
+        <div class="card-head">
+          <div><h3>Identity</h3><div class="summary muted small" id="sum-identity"></div></div>
+          <div class="head-tools"></div>
+        </div>
+        <dl class="facts">
+          <div><dt>Status</dt><dd id="p-status">—</dd></div>
+          <div><dt>Enrolled ID</dt><dd><code id="p-id">—</code></dd></div>
+          <div><dt>Requested</dt><dd id="p-requested">—</dd></div>
+          <div><dt>Enrolled</dt><dd id="p-enrolled">—</dd></div>
+          <div><dt>Channel since</dt><dd id="p-channel">—</dd></div>
+          <div><dt>Local address</dt><dd id="p-host">—</dd></div>
+        </dl>
+      </div>
+      <div class="card collapsible" id="card-members">
+        <div class="card-head">
+          <div><h3>Registered members</h3><div class="summary muted small" id="sum-members"></div></div>
+          <div class="head-tools">
+            <button class="btn small primary add-btn" type="button" id="add-member-btn"><span aria-hidden="true">+</span> Add member</button>
+          </div>
+        </div>
+        <div id="members-list" class="members"></div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="confirm-dialog">
+    <form method="dialog">
+      <h3>Register this worker?</h3>
+      <p>This sends a registration request to</p>
+      <p><code id="confirm-url"></code></p>
+      <p class="muted">as <strong id="confirm-name"></strong>. Someone on the server has to approve it before an ID is allocated.</p>
+      <div class="actions end">
+        <button class="btn ghost" value="cancel">Cancel</button>
+        <button class="btn primary" value="register" id="confirm-register">Register</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="member-dialog">
+    <form id="member-form" novalidate>
+      <h3 id="member-dialog-title">Add member</h3>
+      <label>Name
+        <input name="name" required maxlength="120" autocomplete="off" placeholder="e.g. Zachary Wing">
+      </label>
+      <div class="month-row">
+        <label>From
+          <input name="from" type="month" required>
+        </label>
+        <label>To
+          <input name="to" type="month">
+        </label>
+      </div>
+      <label class="check"><input type="checkbox" name="present"> Still a member (no end date)</label>
+      <label>Similarity <span class="muted small">— a repo must score at least this (0 to 1) to be sent for this person's jobs</span>
+        <div class="sim-row">
+          <input name="similarity_range" type="range" min="0" max="1" step="0.01" value="0.6" aria-label="Similarity slider">
+          <input name="similarity" type="number" min="0" max="1" step="0.01" value="0.6" required>
+        </div>
+      </label>
+      <p class="form-error" id="member-error" hidden></p>
+      <div class="actions end">
+        <button class="btn ghost" type="button" id="member-cancel">Cancel</button>
+        <button class="btn primary" type="submit" id="member-submit">Add</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="jd-dialog" class="jd-dialog">
+    <form method="dialog">
+      <div class="jd-head">
+        <div>
+          <div class="eyebrow" id="jd-meta"></div>
+          <h3 id="jd-title"></h3>
+          <div class="muted" id="jd-person"></div>
+        </div>
+        <button class="btn icon" value="close" aria-label="Close">&times;</button>
+      </div>
+      <div class="jd-body" id="jd-body"></div>
+      <div class="actions end"><button class="btn primary" value="close">Close</button></div>
+    </form>
+  </dialog>
+
+  <div id="toast" role="status" hidden></div>
+</body>
+</html>
