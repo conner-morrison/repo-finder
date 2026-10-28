@@ -117,6 +117,52 @@
           <div><dt>Local address</dt><dd id="p-host">—</dd></div>
         </dl>
       </div>
+      <div class="card collapsible" id="card-mode">
+        <div class="card-head">
+          <div><h3>Work mode</h3><div class="summary muted small" id="sum-mode"></div></div>
+          <div class="head-tools"><span class="pill active" id="mode-pill">—</span></div>
+        </div>
+        <p class="muted small">What this worker does with each related job. Each mode follows its own rules file.</p>
+        <div class="modes">
+          <label class="engine"><input type="radio" name="mode" value="github">
+            <span><strong>GitHub search</strong><br>
+            <span class="muted small">Finds 1–2 similar repos made within the member's period, analyses them and replies with the links.</span><br>
+            <code class="small">rules/github-search.md</code></span></label>
+          <label class="engine"><input type="radio" name="mode" value="missed">
+            <span><strong>Missed</strong><br>
+            <span class="muted small">Analyses each related JD, composes 1–2 matching past projects and replies with them. GitHub search is paused in this mode.</span><br>
+            <code class="small">rules/missed.md</code></span></label>
+        </div>
+      </div>
+      <div class="card collapsible" id="card-ai">
+        <div class="card-head">
+          <div><h3>AI engine</h3><div class="summary muted small" id="sum-ai"></div></div>
+          <div class="head-tools"><span class="pill" id="ai-pill">—</span></div>
+        </div>
+        <p class="muted small">Who searches GitHub, judges similarity, analyses the repos and writes the report for each related job.</p>
+        <div class="session-status" id="session-status"></div>
+        <div class="engines" id="engines">
+          <label class="engine"><input type="radio" name="engine" value="auto">
+            <span><strong>Automatic</strong> <span class="muted small">(recommended)</span><br>
+            <span class="muted small">Debug mode: the Claude Code session running this project is its AI — the project hands it each job and it hands back the result. Normal mode (<code>DEBUG=0</code>): the Claude API.</span></span></label>
+          <label class="engine"><input type="radio" name="engine" value="claude">
+            <span><strong>Claude API</strong> <span class="muted small" id="ai-model"></span><br>
+            <span class="muted small">Claude plans the search, scores every candidate with a reason, analyses the picks and writes the report. About $1 per job.</span></span></label>
+          <label class="engine"><input type="radio" name="engine" value="session">
+            <span><strong>Claude Code session</strong> <span class="muted small">(always, even outside debug mode)</span><br>
+            <span class="muted small">Until an API key is added: each job is written to <code>ai_tasks/pending/</code> and the Claude Code session does the AI work, then submits it.</span></span></label>
+          <label class="engine"><input type="radio" name="engine" value="rules">
+            <span><strong>Rules only</strong><br>
+            <span class="muted small">No AI: keyword search and word-matching scores. Free, less accurate.</span></span></label>
+        </div>
+        <form id="key-form" class="key-row">
+          <input name="key" type="password" placeholder="Anthropic API key (sk-ant-…)" autocomplete="off">
+          <button class="btn primary" type="submit">Save key</button>
+          <button class="btn ghost" type="button" id="clear-key">Remove</button>
+        </form>
+        <p class="muted small" id="key-status"></p>
+      </div>
+
       <div class="card collapsible" id="card-members">
         <div class="card-head">
           <div><h3>Registered members</h3><div class="summary muted small" id="sum-members"></div></div>

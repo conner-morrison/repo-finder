@@ -34,6 +34,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import ai
 import analyzer
 import finder
 
@@ -86,6 +87,10 @@ DEFAULT_STATE = {
     "messages": [],
     "members": [],
     "matches": {},
+    "compositions": {},     # missed mode: per job, the JD analysis and the missed experience
+    # engine: "auto" (debug mode -> this Claude Code session, otherwise the Claude API),
+    # "session" (hand-off to a Claude Code session), "claude" (Claude API), "rules" (no AI)
+    "settings": {"engine": "auto", "anthropic_api_key": ""},
     "log": [],
 }
 
@@ -100,6 +105,12 @@ def load_state():
             saved = json.loads(STATE_FILE.read_text())
             state.update({k: v for k, v in saved.items() if k in state})
             state["stats"] = {**DEFAULT_STATE["stats"], **(saved.get("stats") or {})}
+            # the mode and its statuses were renamed from composing/composed to missed
+            if (state.get("settings") or {}).get("mode") == "composing":
+                state["settings"]["mode"] = "missed"
+            renamed = {"composed": "missed", "composing": "in_progress"}
+            for c in state["compositions"].values():
+                c["status"] = renamed.get(c["status"], c["status"])
         except (OSError, ValueError) as exc:
             print(f"state.json unreadable, starting fresh: {exc}", file=sys.stderr)
     return state
@@ -385,6 +396,43 @@ def update_member(body):
 jobs_queue = queue.Queue()
 queued = set()
 ACTIVE_MATCH = ("queued", "searching")
+ENGINES = ("auto", "session", "claude", "rules")
+MODES = {"github": ("GitHub search", "rules/github-search.md"),
+         "missed": ("Missed", "rules/missed.md")}
+HEARTBEAT = ROOT / "ai_tasks" / "session_heartbeat"
+SESSION_FRESH = 30          # seconds: a session that touched the heartbeat this recently is listening
+
+
+def engine_choice():
+    e = (STATE.get("settings") or {}).get("engine")
+    return e if e in ENGINES else "auto"
+
+
+def work_mode():
+    m = (STATE.get("settings") or {}).get("mode")
+    return m if m in MODES else "github"
+
+
+def engine():
+    """The engine that will actually run. In debug mode the Claude Code session
+    driving this run is the project's AI: the project hands it each job and it
+    hands the result back. Outside debug mode the Claude API does the same work."""
+    e = engine_choice()
+    if e == "auto":
+        return "session" if DEBUG else "claude"
+    return e
+
+
+def session_seen():
+    """Seconds since the Claude Code session last checked in, or None if never."""
+    try:
+        return max(0, int(time.time() - HEARTBEAT.stat().st_mtime))
+    except OSError:
+        return None
+
+
+def api_key():
+    return os.environ.get("ANTHROPIC_API_KEY") or (STATE.get("settings") or {}).get("anthropic_api_key") or ""
 
 
 def same_person(a, b):
@@ -416,22 +464,25 @@ def jobs_by_id():
 
 
 def member_for(job):
-    """The member this job is related to, and if none, why not."""
+    """The member this job is related to, and if none, why not. A job belongs to
+    a member by its person alone; the member's period is the rule for which
+    repos may answer it (see search_job), not for which jobs count."""
     if not job["person"]:
         return None, "no person on this job"
-    month = time.strftime("%Y-%m", time.localtime(job["ts"])) if job["ts"] else time.strftime("%Y-%m")
     named = [m for m in STATE["members"] if same_person(m["name"], job["person"])]
     if not named:
         return None, f"{job['person']} is not a registered member"
-    for m in named:
-        if m["from"] <= month <= (m["to"] or "9999-12"):
-            return m, None
-    return None, f"posted {month}, outside {job['person']}'s registered period"
+    if len(named) > 1 and job["ts"]:   # same name twice: prefer the one whose period covers the post
+        month = time.strftime("%Y-%m", time.localtime(job["ts"]))
+        named.sort(key=lambda m: not (m["from"] <= month <= (m["to"] or "9999-12")))
+    return named[0], None
 
 
 def plan_jobs(force=None):
     """Decide what each job needs, and queue the ones that need a search (or a
     reply that has not reached the server yet)."""
+    if work_mode() == "missed":      # each mode follows its own rules; GitHub search waits
+        return plan_compose(force)
     todo = []
     with lock:
         for jid, job in jobs_by_id().items():
@@ -451,9 +502,13 @@ def plan_jobs(force=None):
             period = [member["from"], member["to"]]
             stale = (not cur or cur["status"] in ("unrelated", "needs_threshold", "error")
                      or cur.get("threshold") != member["similarity"] or cur.get("period") != period
+                     or cur.get("engine_mode", "rules") != engine()
                      or (cur["status"] == "found" and any("analysis" not in r for r in cur.get("repos") or [])))
+            if cur and cur["status"] == "awaiting_ai" and not stale and force != jid:
+                continue
             if stale or force == jid:
-                STATE["matches"][jid] = {**base, "status": "queued", "threshold": member["similarity"],
+                keep = {k: cur[k] for k in ("reply", "sent_repos") if cur and cur.get(k)}
+                STATE["matches"][jid] = {**base, **keep, "status": "queued", "threshold": member["similarity"],
                                          "period": period, "updated_at": now()}
                 todo.append(("search", jid))
             elif cur["status"] == "found" and (cur.get("reply") or {}).get("status") != "sent":
@@ -485,34 +540,123 @@ def search_job(jid):
             return
         match.update(status="searching", updated_at=now())
         save()
-    threshold, period = match["threshold"], match["period"]
-    log("info", f"Searching GitHub for repos like job {jid} — “{job['title']}” (similarity ≥ {threshold:.2f}, "
-                f"created and last pushed within {period[0]} – {period[1] or 'now'})")
-    # Repos already posted on the channel (another worker's output for these
-    # jobs) are answers, not examples to point at.
-    exclude = urls_in([m.get("body") for m in STATE["messages"]], set())
+    threshold, period, mode = match["threshold"], match["period"], engine()
+    # Any repo may be picked, including ones another worker has already picked
+    # for this or another job (it publishes copies of what this worker finds).
+    exclude = set()
+    where = f"similarity ≥ {threshold:.2f}, created and last pushed within {period[0]} – {period[1] or 'now'}"
+
+    if mode == "session":
+        path = ai.create_task(job, match, exclude)
+        with lock:
+            match.update(status="awaiting_ai", engine_mode=mode, task=str(path.relative_to(ROOT)), updated_at=now())
+            save()
+        log("info", f"Job {jid} handed to the Claude Code session for AI search and analysis ({where})")
+        return
+
+    log("info", f"Searching GitHub for repos like job {jid} — “{job['title']}” ({where}; engine {mode})")
     try:
-        res = finder.find_similar(job["title"], job["description"], threshold, exclude=exclude,
-                                  period=tuple(period), analyze=analyzer.analyze,
-                                  log=lambda t: debug("finder", t))
+        if mode == "claude":
+            if not api_key():
+                raise ai.AIError("no Anthropic API key: add one in Profile → AI engine")
+            res = ai.run_claude(job, threshold, period, exclude, api_key(), log=lambda t: log("info", f"[{jid}] {t}"))
+        else:
+            res = finder.find_similar(job["title"], job["description"], threshold, exclude=exclude,
+                                      period=tuple(period), analyze=analyzer.analyze,
+                                      log=lambda t: debug("finder", t))
+            res["engine"] = "rules"
     except Exception as exc:
         with lock:
-            match.update(status="error", error=str(exc), updated_at=now())
+            match.update(status="error", error=str(exc), engine_mode=mode, updated_at=now())
             save()
         log("error", f"Search for job {jid} failed: {exc}")
         return
+    apply_result(jid, res, mode)
+
+
+def apply_result(jid, res, mode):
+    """Keep a finished search with its job and, when it found something, reply."""
     with lock:
-        match.update(status="found" if res["repos"] else "none", repos=res["repos"], best_score=res["best_score"],
-                     considered=res["considered"], profile=res["profile"], searched_at=now(), reply=None,
-                     error=None, updated_at=now())
+        match = STATE["matches"][jid]
+        # The same repos already reached the channel (e.g. only the threshold moved):
+        # keep that reply instead of posting a duplicate.
+        prev_reply, sent = match.get("reply") or {}, match.get("sent_repos")
+        if not sent:   # older replies left no record: the channel's echo of our own reply is the truth
+            echo = [m for m in STATE["messages"] if m.get("sender") == STATE["name"]
+                    and isinstance(m.get("body"), dict) and m["body"].get("job_id") == jid and m["body"].get("repos")]
+            if echo:
+                sent = [{"url": r["url"]} for r in echo[-1]["body"]["repos"]]
+                prev_reply = {"status": "sent", "seq": echo[-1].get("seq"), "at": echo[-1].get("received_at")}
+        same = (prev_reply.get("status") == "sent" and bool(res["repos"])
+                and sorted(r["url"] for r in res["repos"]) == sorted(r["url"] for r in sent or []))
+        match.update(status="found" if res["repos"] else "none", repos=res["repos"],
+                     best_score=res.get("best_score", 0), considered=res.get("considered", 0),
+                     profile=res.get("profile"), summary=res.get("summary"), report=res.get("report"),
+                     queries=res.get("queries"), engine=res.get("engine"), usage=res.get("usage"),
+                     sent_repos=sent if same else match.get("sent_repos"),
+                     engine_mode=mode, searched_at=now(), reply=prev_reply if same else None, error=None, task=None,
+                     updated_at=now())
+        cost = (res.get("usage") or {}).get("cost_usd")
+        if cost:
+            STATE["stats"]["ai_cost_usd"] = round(STATE["stats"].get("ai_cost_usd", 0) + cost, 4)
         save()
+    ai.close_task(jid)
     if res["repos"]:
-        log("ok", f"Job {jid}: {len(res['repos'])} similar repo(s) — "
+        log("ok", f"Job {jid}: {len(res['repos'])} similar repo(s) [{res.get('engine')}] — "
                   + ", ".join(f"{r['name']} ({r['score']:.2f})" for r in res["repos"]))
-        send_reply(jid)
+        if same:
+            log("info", f"Job {jid}: same repos as the reply already sent (seq {prev_reply.get('seq')}); not posting again")
+        else:
+            send_reply(jid)
     else:
-        log("warn", f"Job {jid}: no repo within the period reached {threshold:.2f} "
-                    f"(best {res['best_score']:.2f} of {res['considered']})")
+        log("warn", f"Job {jid}: no repo within the period reached {match['threshold']:.2f} "
+                    f"(best {res.get('best_score', 0):.2f} of {res.get('considered', 0)}) [{res.get('engine')}]")
+
+
+def submit_ai_result(body):
+    """A hand-off result from the Claude Code session."""
+    jid = body.get("job_id")
+    job = jobs_by_id().get(jid)
+    match = STATE["matches"].get(jid)
+    if not job or not match or match.get("status") not in ("awaiting_ai", "error", "none", "found"):
+        raise BadRequest(f"job {jid} is not waiting for an AI result")
+    try:
+        res = ai.validate(body.get("result") or {}, match["threshold"])
+    except (ai.AIError, ValueError, TypeError) as exc:
+        raise BadRequest(f"result rejected: {exc}")
+    res["report"] = ai.report_text(job, res, match["threshold"], match["period"])
+    apply_result(jid, res, "session")
+
+
+def reply_body(jid, match, at=None):
+    """The message posted to the channel for a job: its id, the person, the rule
+    used and each repo with its url, reasons and analysis."""
+    # Each repo goes with its url and what it is made of. Nothing about who
+    # owns or wrote it: no owner, contributors, licence or popularity.
+    return {
+        "event": "similar_repos",
+        "job_id": jid,
+        "person": match["person"],
+        "worker": STATE["name"],
+        "threshold": match["threshold"],
+        "period": {"from": match["period"][0], "to": match["period"][1] or "present"},
+        "engine": match.get("engine"),
+        "summary": match.get("summary"),
+        "links": [{"url": r["url"], "label": f"{r['name'].split('/')[-1]} · similarity {r['score']:.2f}"}
+                  for r in match["repos"]],
+        "repos": [{
+            "url": r["url"],
+            "similarity": r["score"],
+            "created": r.get("created"),
+            "last_push": r.get("last_push"),
+            **({"reason": r["reason"]} if r.get("reason") else {}),
+            **({"fit": r["fit"]} if r.get("fit") else {}),
+            **(r.get("analysis") or {}),
+            "description": analyzer.as_text(r.get("analysis") or {}) or r.get("description"),
+        } for r in match["repos"]],
+        **({"report": match["report"]} if match.get("report") else {}),
+        "at": at or now(),
+    }
 
 
 def send_reply(jid):
@@ -524,32 +668,15 @@ def send_reply(jid):
             match["reply"] = {"status": "pending", "error": "worker is not active on a channel yet", "at": now()}
             save()
             return
-        # Each repo goes with its url and what it is made of. Nothing about who
-        # owns or wrote it: no owner, contributors, licence or popularity.
-        body = {
-            "event": "similar_repos",
-            "job_id": jid,
-            "person": match["person"],
-            "worker": STATE["name"],
-            "threshold": match["threshold"],
-            "period": {"from": match["period"][0], "to": match["period"][1] or "present"},
-            "links": [{"url": r["url"], "label": f"{r['name'].split('/')[-1]} · similarity {r['score']:.2f}"}
-                      for r in match["repos"]],
-            "repos": [{
-                "url": r["url"],
-                "similarity": r["score"],
-                "created": r.get("created"),
-                "last_push": r.get("last_push"),
-                **(r.get("analysis") or {}),
-                "description": analyzer.as_text(r.get("analysis") or {}) or r.get("description"),
-            } for r in match["repos"]],
-            "at": now(),
-        }
+        body = reply_body(jid, match)
         channel = match["channel"]
-    code, data = relay("POST", "/publish", {"channel": channel, "body": body}, token=STATE["worker_id"])
+    request = {"channel": channel, "body": body}
+    code, data = relay("POST", "/publish", request, token=STATE["worker_id"])
     ok = code < 300
     with lock:
-        match["reply"] = {"status": "sent" if ok else "failed", "code": code, "at": now(),
+        if ok:
+            match["sent_repos"] = [{"url": r["url"]} for r in match["repos"]]
+        match["reply"] = {"status": "sent" if ok else "failed", "code": code, "at": now(), "request": request,
                           "seq": field(data, "seq") if ok else None,
                           "error": None if ok else (field(data, "message", "detail") or f"HTTP {code}")}
         save()
@@ -559,13 +686,168 @@ def send_reply(jid):
         log("error", f"Reply to job {jid} on #{channel} refused: {match['reply']['error']}")
 
 
+# --- missed mode -------------------------------------------------------------------
+# rules/missed.md: for each related job, step 1 analyses the JD, step 2 composes
+# 1-2 past projects from that analysis and the member's real work (the repos GitHub
+# search found for the job), step 3 scores each project against the analysis and
+# rewrites the ones below the member's similarity value, and the result is posted to
+# the job's channel as a reply carrying the job id, the same way GitHub search replies.
+
+ACTIVE_COMPOSE = ("queued", "in_progress")
+
+
+def plan_compose(force=None):
+    todo = []
+    with lock:
+        for jid, job in jobs_by_id().items():
+            member, why = member_for(job)
+            cur = STATE["compositions"].get(jid)
+            base = {"job_id": jid, "person": job["person"], "channel": job["channel"]}
+            if not member:
+                if not cur or cur["status"] in ("unrelated",):
+                    STATE["compositions"][jid] = {**base, "status": "unrelated", "reason": why, "updated_at": now()}
+                continue
+            base.update(member=member["name"], member_id=member["id"])
+            bar = member.get("similarity")
+            if bar is None:
+                STATE["compositions"][jid] = {**base, "status": "needs_threshold", "updated_at": now()}
+                continue
+            if cur and cur["status"] in ACTIVE_COMPOSE:
+                continue
+            if cur and cur["status"] == "awaiting_ai" and cur.get("engine_mode") == engine() \
+                    and cur.get("threshold") == bar and force != jid:
+                continue
+            scores = [x["score"] for x in (cur or {}).get("scores") or []]
+            if cur and cur["status"] in ("missed", "below_score") and scores and cur.get("threshold") != bar:
+                # the bar moved: the scores already say whether the projects still pass
+                cur.update(threshold=bar, status="missed" if min(scores) >= bar else "below_score",
+                           updated_at=now())
+            stale = not cur or cur["status"] in ("unrelated", "needs_threshold", "error") or \
+                (cur["status"] == "awaiting_ai" and (cur.get("engine_mode") != engine() or cur.get("threshold") != bar)) or \
+                (cur["status"] in ("missed", "below_score") and not scores)
+            if stale or force == jid:
+                STATE["compositions"][jid] = {**base, "status": "queued", "threshold": bar, "updated_at": now()}
+                todo.append(("compose", jid))
+            elif cur["status"] == "missed" and (cur.get("reply") or {}).get("status") != "sent":
+                todo.append(("compose_reply", jid))
+        save()
+    for item in todo:
+        if item not in queued:
+            queued.add(item)
+            jobs_queue.put(item)
+
+
+def own_repos(jid):
+    """The member's real work for this job: what GitHub search found for it."""
+    m = STATE["matches"].get(jid) or {}
+    return (m.get("repos") or []) if m.get("status") == "found" else []
+
+
+def compose_job(jid):
+    job = jobs_by_id().get(jid)
+    with lock:
+        comp = STATE["compositions"].get(jid)
+        if not job or not comp:
+            return
+        comp.update(status="in_progress", updated_at=now())
+        save()
+    mode, repos = engine(), own_repos(jid)
+    grounding = f"{len(repos)} repo(s) of the member's work" if repos else "no repos found for it yet"
+    if mode == "session":
+        path = ai.create_compose_task(job, comp, repos)
+        with lock:
+            comp.update(status="awaiting_ai", engine_mode=mode, task=str(path.relative_to(ROOT)), updated_at=now())
+            save()
+        log("info", f"Job {jid} handed to the Claude Code session for missed ({grounding})")
+        return
+    log("info", f"Missed job {jid} — “{job['title']}” ({grounding}; engine {mode})")
+    try:
+        if mode != "claude":
+            raise ai.AIError("missed needs an AI engine: pick Claude API or Claude Code session")
+        if not api_key():
+            raise ai.AIError("no Anthropic API key: add one in Profile → AI engine")
+        res = ai.run_compose(job, repos, comp["threshold"], api_key(), log=lambda t: log("info", f"[{jid}] {t}"))
+    except Exception as exc:
+        with lock:
+            comp.update(status="error", error=str(exc), engine_mode=mode, updated_at=now())
+            save()
+        log("error", f"Missed job {jid} failed: {exc}")
+        return
+    apply_compose(jid, res, mode)
+
+
+def apply_compose(jid, res, mode):
+    job = jobs_by_id()[jid]
+    with lock:
+        comp = STATE["compositions"][jid]
+        comp.update(status="below_score" if res["below"] else "missed", analysis=res["analysis"],
+                    projects=res["projects"], scores=res["scores"], rounds=res["rounds"],
+                    text=ai.compose_text(job, res), engine=res.get("engine"), usage=res.get("usage"),
+                    grounded_on=[r["url"] for r in own_repos(jid)], engine_mode=mode, missed_at=now(),
+                    reply=None, error=None, task=None, updated_at=now())
+        cost = (res.get("usage") or {}).get("cost_usd")
+        if cost:
+            STATE["stats"]["ai_cost_usd"] = round(STATE["stats"].get("ai_cost_usd", 0) + cost, 4)
+        save()
+    ai.close_task(jid, ai.COMPOSE)
+    scored = "; ".join(f"{p['title']} ({sc['score']:.2f})" for p, sc in zip(res["projects"], res["scores"]))
+    if res["below"]:
+        log("warn", f"Job {jid}: still below {comp['threshold']:.2f} after {res['rounds']} rewrite(s) — "
+                    f"{scored}. Not posting; use Compose again.")
+        return
+    log("ok", f"Job {jid}: missed {len(res['projects'])} project(s) at or above {comp['threshold']:.2f} "
+              f"after {res['rounds']} rewrite(s) [{res.get('engine')}] — {scored}")
+    send_compose_reply(jid)
+
+
+def submit_compose_result(body):
+    """A missed result from the Claude Code session."""
+    jid = body.get("job_id")
+    comp = STATE["compositions"].get(jid)
+    if jid not in jobs_by_id() or not comp or comp.get("status") not in ("awaiting_ai", "error", "missed", "below_score"):
+        raise BadRequest(f"job {jid} is not waiting for a missed result")
+    try:
+        res = ai.validate_compose(body.get("result") or {}, comp["threshold"])
+    except (ai.AIError, ValueError, TypeError, AttributeError) as exc:
+        raise BadRequest(f"result rejected: {exc}")
+    apply_compose(jid, res, "session")
+
+
+def send_compose_reply(jid):
+    with lock:
+        comp = STATE["compositions"].get(jid)
+        if not comp or comp["status"] != "missed":
+            return
+        if not STATE["worker_id"] or STATE["status"] != "active":
+            comp["reply"] = {"status": "pending", "error": "worker is not active on a channel yet", "at": now()}
+            save()
+            return
+        body = {"event": "missed_experience", "job_id": jid, "person": comp["person"], "worker": STATE["name"],
+                "engine": comp.get("engine"), "threshold": comp["threshold"], "analysis": comp["analysis"],
+                "projects": comp["projects"], "scores": comp["scores"], "rewrites": comp.get("rounds", 0),
+                "report": comp["text"], "at": now()}
+        channel = comp["channel"]
+    request = {"channel": channel, "body": body}
+    code, data = relay("POST", "/publish", request, token=STATE["worker_id"])
+    ok = code < 300
+    with lock:
+        comp["reply"] = {"status": "sent" if ok else "failed", "code": code, "at": now(), "request": request,
+                         "seq": field(data, "seq") if ok else None,
+                         "error": None if ok else (field(data, "message", "detail") or f"HTTP {code}")}
+        save()
+    if ok:
+        log("ok", f"Replied to job {jid} on #{channel} with the missed experience")
+    else:
+        log("error", f"Missed reply to job {jid} on #{channel} refused: {comp['reply']['error']}")
+
+
 def finder_loop():
     while True:
         item = jobs_queue.get()
         queued.discard(item)
         kind, jid = item
         try:
-            search_job(jid) if kind == "search" else send_reply(jid)
+            {"search": search_job, "reply": send_reply, "compose": compose_job, "compose_reply": send_compose_reply}[kind](jid)
         except Exception as exc:
             log("error", f"{kind} for job {jid} failed: {exc}")
 
@@ -574,6 +856,13 @@ def public_state():
     with lock:
         s = json.loads(json.dumps(STATE))
     s.update(app=APP_NAME, debug=DEBUG, host=f"http://{HOST}:{PORT}")
+    key = api_key()
+    seen = session_seen()
+    s["settings"] = {"engine": engine(), "choice": engine_choice(), "mode": work_mode(),
+                     "modes": {k: {"name": n, "rules": r} for k, (n, r) in MODES.items()},
+                     "session": {"connected": seen is not None and seen <= SESSION_FRESH, "seen_ago": seen},
+                     "has_key": bool(key), "key_hint": f"…{key[-4:]}" if key else "",
+                     "key_from_env": bool(os.environ.get("ANTHROPIC_API_KEY")), "model": ai.MODEL}
     if not DEBUG:
         s.pop("last_response", None)
     return s
@@ -646,10 +935,33 @@ class Handler(BaseHTTPRequestHandler):
                     STATE["members"] = [m for m in STATE["members"] if m["id"] != body.get("id")]
                     save()
                 plan_jobs()
+            elif self.path == "/api/ai/result":
+                submit_ai_result(body)
+            elif self.path == "/api/ai/compose":
+                submit_compose_result(body)
+            elif self.path == "/api/settings":
+                with lock:
+                    st = STATE.setdefault("settings", {})
+                    if body.get("engine") in ENGINES:
+                        st["engine"] = body["engine"]
+                    if body.get("mode") in MODES:
+                        st["mode"] = body["mode"]
+                    if isinstance(body.get("anthropic_api_key"), str) and body["anthropic_api_key"].strip():
+                        st["anthropic_api_key"] = body["anthropic_api_key"].strip()
+                    if body.get("clear_key"):
+                        st["anthropic_api_key"] = ""
+                    save()
+                log("info", f"Work mode: {MODES[work_mode()][0]} · AI engine: {engine()}"
+                    + (" (API key set)" if api_key() else ""))
+                plan_jobs()
             elif self.path == "/api/jobs/search":
                 if body.get("job_id") not in jobs_by_id():
                     raise BadRequest("No such job")
                 plan_jobs(force=body["job_id"])
+            elif self.path == "/api/jobs/compose":
+                if body.get("job_id") not in jobs_by_id():
+                    raise BadRequest("No such job")
+                plan_compose(force=body["job_id"])
             elif self.path == "/api/clear-log":
                 with lock:
                     STATE["log"], STATE["messages"] = [], []
@@ -670,6 +982,10 @@ def serve():
             if m["status"] in ACTIVE_MATCH:
                 m["status"] = "error"
                 m["error"] = "interrupted by a restart"
+        for c in STATE["compositions"].values():
+            if c["status"] in ACTIVE_COMPOSE:
+                c["status"] = "error"
+                c["error"] = "interrupted by a restart"
     threading.Thread(target=worker_loop, name="worker", daemon=True).start()
     threading.Thread(target=finder_loop, name="finder", daemon=True).start()
     plan_jobs()

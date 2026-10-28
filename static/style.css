@@ -212,6 +212,31 @@ a.repo-name { text-decoration: none; } a.repo-name:hover { text-decoration: unde
 .member:hover { border-color: var(--accent); box-shadow: 0 2px 10px rgba(52, 81, 209, .1); }
 .btn.edit { color: var(--accent); }
 
+/* AI engine */
+.engines { display: grid; gap: 8px; margin: 12px 0; }
+.modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; margin: 12px 0 0; }
+.engine { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; font-weight: 400; margin: 0; }
+.engine:has(input:checked) { border-color: var(--accent); background: var(--wait-bg); }
+.engine input { margin-top: 3px; accent-color: var(--accent); width: auto; display: inline; }
+.key-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.key-row input { flex: 1 1 240px; margin: 0; }
+.engine-line { font-size: 11px; color: var(--muted); margin-top: 6px; text-transform: uppercase; letter-spacing: .04em; }
+.ai-summary { margin: 6px 0 0; font-size: 13px; }
+.repo-reason, .repo-fit { font-size: 13px; margin-top: 6px; }
+.repo-fit { color: var(--ok); }
+.highlights { margin: 8px 0 0; padding-left: 18px; font-size: 13px; }
+.highlights li { margin: 3px 0; }
+.score.low .score-v { color: var(--warn); } .score.low .score-bar > div { background: var(--warn); }
+.an.tools_technologies { border-top-color: #7a5af8; } .an.responsibilities { border-top-color: #0e9384; }
+.an.seniority_signals { border-top-color: #dd2590; } .an.ats_keywords { border-top-color: #dc6803; }
+.report { margin-top: 10px; }
+.report > summary { cursor: pointer; font-size: 12px; font-weight: 700; color: var(--accent); }
+.report pre { white-space: pre-wrap; background: var(--bg); padding: 12px; border-radius: 8px; max-height: 420px; overflow: auto; font-size: 12px; }
+
+.session-status { margin-top: 10px; padding: 8px 12px; border-radius: 8px; font-size: 13px; font-weight: 600; }
+.session-status.on { background: var(--ok-bg); color: var(--ok); }
+.session-status.off { background: var(--warn-bg); color: var(--warn); }
+
 #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 8px 16px; border-radius: 8px; font-weight: 600; }
 
 @media (max-width: 560px) {

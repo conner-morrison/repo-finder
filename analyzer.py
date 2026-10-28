@@ -19,6 +19,7 @@ dependency manifests, GitHub Actions workflows and a few main source files.
 
 import json
 import re
+import urllib.parse
 
 from finder import gh
 
@@ -169,7 +170,9 @@ def tree_of(full_name, branch):
 
 def raw_file(full_name, path):
     try:
-        return gh(f"/repos/{full_name}/contents/{path}", accept="application/vnd.github.raw+json") or ""
+        # paths can hold spaces or other characters a URL cannot carry as-is
+        return gh(f"/repos/{full_name}/contents/{urllib.parse.quote(path)}",
+                  accept="application/vnd.github.raw+json") or ""
     except RuntimeError:
         return ""
 
@@ -222,7 +225,8 @@ def deps_from(name, text):
 def main_sources(paths, language):
     """A handful of files most likely to hold the real logic."""
     exts = {"JavaScript": (".js", ".mjs", ".gs"), "TypeScript": (".ts",), "Python": (".py",), "PHP": (".php",),
-            "Go": (".go",), "Ruby": (".rb",), "Java": (".java",), "C#": (".cs",)}.get(language, (".js", ".ts", ".py", ".gs"))
+            "Go": (".go",), "Ruby": (".rb",), "Java": (".java",), "C#": (".cs",),
+            "Blade": (".php",), "Vue": (".vue", ".js", ".ts")}.get(language, (".js", ".ts", ".py", ".gs", ".php"))
     skip = re.compile(r"(^|/)(node_modules|vendor|dist|build|test|tests|__tests__|\.github|docs?|examples?)/|\.min\.|\.d\.ts$|config")
     cands = [p for p in paths if p.endswith(exts) and not skip.search(p)]
     pri = lambda p: (p.count("/"), not re.search(r"(main|index|app|server|code|core|sync|migrat|service)", p, re.I), len(p))

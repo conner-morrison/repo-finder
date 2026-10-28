@@ -43,8 +43,8 @@ GitHub's lower anonymous rate limit.
 A member has a name, a period (*from* / *to* month, or still current) and a
 **similarity** threshold from 0 to 1.
 
-A job is **related** to a member when the job's `person` is that member and
-the job was posted inside the member's period. A repost of a job without a
+A job is **related** to a member when the job's `person` is that member; the
+member's period is the rule for which repos may answer it. A repost of a job without a
 person takes it from another post with the same job id.
 
 For each related job the worker:
@@ -64,8 +64,52 @@ For each related job the worker:
 5. replies on the job's channel (`POST {server}/publish`) with the `job_id`,
    and each repo's url, similarity, dates and analysis.
 
-The scoring and analysis are rule-based (no language model), so they reflect
-what a repository says about itself.
+## Missed mode
+
+*Profile → Work mode → Missed* switches from finding repos to missed a
+reply ([rules/missed.md](rules/missed.md)). For each related job:
+
+1. **Analyse the JD** by [rules/analyzing-step-missed.md](rules/analyzing-step-missed.md):
+   must-have skills, tools, responsibilities, seniority signals, ATS keywords and
+   the real problem to solve;
+2. **Compose the experience** by [rules/experience-missed.md](rules/experience-missed.md):
+   1–2 past projects grounded on the repos GitHub search found for the job, each
+   with 4 or 6 highlight bullets;
+3. **Score and rewrite** by [rules/scoring-missed.md](rules/scoring-missed.md):
+   each project is scored 0–1 against the analysis (real problem 30 %, must-haves
+   20 %, responsibilities 15 %, tools 15 %, seniority 10 %, ATS keywords 10 %;
+   tools and keywords are counted, the rest judged by the AI). Any project below
+   the member's similarity value is rewritten and scored again, up to 3 times;
+   if it's still below, the job is marked *below score* and not posted;
+4. **Reply** on the job's channel (`POST {server}/publish`, event
+   `missed_experience`) with the `job_id`, the analysis, the projects and the
+   readable text.
+
+It runs on the Claude API or a Claude Code session (`python3 ai.py compose-submit
+<job> result.json`); *Rules only* can't compose. A job is missed once —
+*Compose again* on its card redoes it.
+
+## AI engine
+
+*Profile → AI engine* chooses who does the search, judging, analysis and
+report ([ai.py](ai.py)):
+
+- **Claude API** (`claude-opus-5-5`): Claude reads the job and writes the
+  search queries; the worker runs them on GitHub inside the member's period;
+  Claude scores every candidate 0–1 with a reason (and rejects SEO pages and
+  portfolios), analyses the picks from their README, manifests, CI and source,
+  and the worker assembles the report. Needs an Anthropic API key — paste it in
+  the panel or set `ANTHROPIC_API_KEY`. Roughly $1 per related job.
+- **Automatic** (default): in debug mode the Claude Code session running the
+  project is its AI; with `DEBUG=0`, the Claude API.
+- **Claude Code session**: the worker writes each related job to
+  `ai_tasks/pending/<job>.json`; an assistant session does the same steps with
+  `python3 ai.py gather|bundle|submit` and posts the result back.
+- **Rules only**: the original keyword search and word-matching score; free.
+
+Install the SDK with `pip install -r requirements.txt`, or where pip is
+missing: `uv pip install --python python3 --target .deps -r requirements.txt`
+(the app picks up `.deps/` automatically).
 
 ## State
 

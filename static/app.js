@@ -219,6 +219,56 @@ function renderMembers(members) {
   }));
 }
 
+// --- work mode ---
+document.querySelectorAll('input[name="mode"]').forEach((r) => r.addEventListener("change", async () => {
+  try { render(await api("/api/settings", { mode: r.value })); toast(`Work mode: ${r.parentElement.querySelector("strong").textContent}`); }
+  catch (err) { toast(err.message); }
+}));
+function renderMode(st) {
+  const set = st.settings || {};
+  const mode = set.mode || "github";
+  document.querySelectorAll('input[name="mode"]').forEach((r) => { r.checked = r.value === mode; });
+  const info = (set.modes || {})[mode] || {};
+  $("mode-pill").textContent = info.name || "—";
+  $("sum-mode").textContent = `${info.name || ""}${info.rules ? ` · rules in ${info.rules}` : ""}${mode !== "github" ? " · GitHub search paused" : ""}`;
+}
+
+// --- AI engine ---
+document.querySelectorAll('input[name="engine"]').forEach((r) => r.addEventListener("change", async () => {
+  try { render(await api("/api/settings", { engine: r.value })); toast(`AI engine: ${r.parentElement.querySelector("strong").textContent}`); }
+  catch (err) { toast(err.message); }
+}));
+$("key-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const key = $("key-form").key.value.trim();
+  if (!key) return toast("Paste the API key first");
+  try { render(await api("/api/settings", { anthropic_api_key: key })); $("key-form").key.value = ""; toast("API key saved"); }
+  catch (err) { toast(err.message); }
+});
+$("clear-key").addEventListener("click", async () => { render(await api("/api/settings", { clear_key: true })); toast("API key removed"); });
+const ENGINE_NAMES = { claude: "Claude API", session: "Claude Code session", rules: "Rules only" };
+const DEBUG_NOTE = (st) => st.debug && st.settings?.choice === "auto" ? " (debug mode)" : "";
+function renderAI(st) {
+  const set = st.settings || {};
+  document.querySelectorAll('input[name="engine"]').forEach((r) => { r.checked = r.value === (set.choice || set.engine); });
+  $("ai-pill").textContent = ENGINE_NAMES[set.engine] || "—";
+  const ses = set.session || {};
+  const box = $("session-status");
+  box.hidden = set.engine !== "session";
+  box.className = `session-status ${ses.connected ? "on" : "off"}`;
+  box.textContent = ses.connected
+    ? `● Claude Code session connected — checked in ${ses.seen_ago}s ago. Jobs are processed as they arrive.`
+    : `○ Claude Code session not connected${ses.seen_ago != null ? ` (last seen ${Math.round(ses.seen_ago / 60)} min ago)` : ""}. Jobs wait in ai_tasks/pending/ until it is.`;
+  $("ai-pill").className = `pill ${set.engine === "rules" ? "" : "active"}`;
+  $("ai-model").textContent = set.model ? `(${set.model})` : "";
+  $("key-status").textContent = set.has_key
+    ? `API key ${set.key_hint} ${set.key_from_env ? "from ANTHROPIC_API_KEY" : "saved"}.` + (set.engine !== "claude" ? " Select “Claude API” to use it." : "")
+    : (set.engine === "claude" ? "No API key yet — jobs will fail until one is saved." : "No API key yet.");
+  const waiting = [...Object.values(st.matches || {}), ...Object.values(st.compositions || {})].filter((m) => m.status === "awaiting_ai").length;
+  const cost = st.stats?.ai_cost_usd;
+  $("sum-ai").textContent = `${ENGINE_NAMES[set.engine] || ""}${DEBUG_NOTE(st)}${set.engine === "session" ? (ses.connected ? " · connected" : " · not connected") : ""}${waiting ? ` · ${waiting} job(s) waiting for the session` : ""}${cost ? ` · API spend $${cost.toFixed(2)}` : ""}`;
+}
+
 $("clear-btn").addEventListener("click", async () => render(await api("/api/clear-log", {})));
 
 // --- profile ---
@@ -306,6 +356,8 @@ function render(s) {
   $("p-host").textContent = s.host;
   $("sum-profile").textContent = `${s.name} · ${s.server_url}`;
   renderMembers(s.members || []);
+  renderMode(s);
+  renderAI(s);
   $("sum-identity").textContent = s.worker_id ? `ID ${s.worker_id}` : "No enrolled ID yet";
 }
 
@@ -340,11 +392,15 @@ function renderJob(m) {
   const top = el("div", "job-top");
   top.append(main, btn);
   card.append(top);
+  const missed = state.settings?.mode === "missed";
   const match = b.job && state.matches?.[b.job];
-  if (match) card.append(renderMatch(match));
-  if (match && match.status !== "unrelated") {
+  const comp = b.job && state.compositions?.[b.job];
+  if (match && (!missed || match.status !== "unrelated")) card.append(renderMatch(match));
+  if (comp && (missed || comp.status !== "unrelated")) card.append(renderComposition(comp));
+  const related = [match, comp].find((x) => x && x.status !== "unrelated");
+  if (related) {
     card.classList.add("related");
-    meta.append(el("span", "tag related-tag", `Related · ${match.member}`));
+    meta.append(el("span", "tag related-tag", `Related · ${related.member}`));
   }
   return card;
 }
@@ -359,6 +415,7 @@ function renderMatch(x) {
     unrelated: `Not related — ${x.reason}`,
     needs_threshold: `Related to ${x.member}. Set ${x.member}'s similarity in Profile → Registered members to start the search.`,
     queued: "Queued for a GitHub search…",
+    awaiting_ai: `${state.settings?.session?.connected ? "Handed to the Claude Code session" : "Waiting for the Claude Code session to connect"} — it searches GitHub (≥ ${Number(x.threshold).toFixed(2)}, made within ${period(x)}), analyses the picks and writes the report…`,
     searching: `Searching GitHub for repos with similarity ≥ ${Number(x.threshold).toFixed(2)}, made within ${period(x)}, and analysing them…`,
     found: `Similar repos (≥ ${Number(x.threshold).toFixed(2)}, made within ${period(x)})`,
     none: `No repo made within ${period(x)} reached ${Number(x.threshold).toFixed(2)} — the best of ${x.considered} scored ${Number(x.best_score).toFixed(2)}`,
@@ -366,7 +423,7 @@ function renderMatch(x) {
   }[x.status] || x.status;
   head.append(el("span", "match-title", say));
   if (x.status === "unrelated") { box.append(head); return box; }
-  if (!["queued", "searching", "needs_threshold"].includes(x.status)) {
+  if (!["queued", "searching", "needs_threshold", "awaiting_ai"].includes(x.status)) {
     const again = el("button", "btn small ghost", "Search again");
     again.type = "button";
     again.addEventListener("click", async () => {
@@ -377,6 +434,11 @@ function renderMatch(x) {
     head.append(again);
   }
   box.append(head);
+  if (x.engine && ["found", "none"].includes(x.status)) {
+    const by = el("div", "engine-line", `By ${x.engine}${x.usage?.cost_usd ? ` · $${x.usage.cost_usd.toFixed(2)}` : ""}`);
+    box.append(by);
+  }
+  if (x.summary && ["found", "none"].includes(x.status)) box.append(el("p", "ai-summary", x.summary));
   if (x.status === "found") {
     const list = el("div", "repos");
     for (const r of x.repos) {
@@ -398,6 +460,8 @@ function renderMatch(x) {
       bar.append(fill); score.append(bar);
       topRow.append(left, score);
       row.append(topRow);
+      if (r.reason) row.append(el("div", "repo-reason", `Why: ${r.reason}`));
+      if (r.fit) row.append(el("div", "repo-fit", `Fit for this job: ${r.fit}`));
       if (r.analysis) row.append(renderAnalysis(r.analysis, `${x.job_id}:${r.url}`));
       list.append(row);
     }
@@ -407,6 +471,109 @@ function renderMatch(x) {
       failed: `✗ Server refused the reply: ${rep.error}`, pending: `Reply waiting: ${rep.error}` }[rep.status] || "Sending reply…";
     box.append(el("div", `reply ${rep.status || "sending"}`, replyText));
   }
+  if (x.report && ["found", "none"].includes(x.status)) {
+    const key = `report:${x.job_id}`;
+    const d = el("details", "report");
+    d.open = openRows.has(key);
+    d.addEventListener("toggle", () => { d.open ? openRows.add(key) : openRows.delete(key); });
+    d.append(el("summary", null, "Full report"), el("pre", null, x.report));
+    box.append(d);
+  }
+  return box;
+}
+
+// Missed mode: the JD analysis (step 1) and the missed projects (step 2).
+const JD = [["must_have_skills", "Must-have skills"], ["tools_technologies", "Tools and technologies"],
+  ["responsibilities", "Responsibilities"], ["seniority_signals", "Seniority signals"], ["ats_keywords", "ATS keywords"]];
+function renderComposition(x) {
+  const box = el("div", `match compose ${{ in_progress: "searching", below_score: "none" }[x.status] || x.status}`);
+  const head = el("div", "match-head");
+  const say = {
+    unrelated: `Not related — ${x.reason}`,
+    queued: "Queued for missed…",
+    in_progress: "Analysing the JD and missed the experience…",
+    awaiting_ai: `${state.settings?.session?.connected ? "Handed to the Claude Code session" : "Waiting for the Claude Code session to connect"} — it analyses the JD and composes the experience…`,
+    needs_threshold: `Related to ${x.member}. Set ${x.member}'s similarity in Profile → Registered members — it is the bar each missed project must reach.`,
+    missed: `Missed experience for ${x.member} (every project ≥ ${Number(x.threshold).toFixed(2)})`,
+    below_score: `Still below ${Number(x.threshold).toFixed(2)} after ${x.rounds} rewrite(s) — not posted. Check it and compose again.`,
+    error: `Missed failed: ${x.error}`,
+  }[x.status] || x.status;
+  head.append(el("span", "match-title", say));
+  if (x.status === "unrelated") { box.append(head); return box; }
+  if (["missed", "below_score", "error"].includes(x.status)) {
+    const again = el("button", "btn small ghost", "Compose again");
+    again.type = "button";
+    again.addEventListener("click", async () => {
+      again.disabled = true;
+      try { render(await api("/api/jobs/compose", { job_id: x.job_id })); toast("Missed again"); }
+      catch (err) { toast(err.message); again.disabled = false; }
+    });
+    head.append(again);
+  }
+  box.append(head);
+  if (!["missed", "below_score"].includes(x.status)) return box;
+  box.append(el("div", "engine-line", `By ${x.engine}${x.usage?.cost_usd ? ` · $${x.usage.cost_usd.toFixed(2)}` : ""}`
+    + ` · grounded on ${x.grounded_on?.length ? `${x.grounded_on.length} repo(s)` : "no repos"} · ${x.rounds || 0} rewrite(s)`));
+  box.append(el("p", "ai-summary", x.analysis.real_problem));
+  const jd = el("details", "analysis");
+  const jdKey = `jd:${x.job_id}`;
+  jd.open = openRows.has(jdKey);
+  jd.addEventListener("toggle", () => { jd.open ? openRows.add(jdKey) : openRows.delete(jdKey); });
+  jd.append(el("summary", null, "JD analysis"));
+  const grid = el("div", "analysis-grid");
+  for (const [k, label] of JD) {
+    if (!x.analysis[k]?.length) continue;
+    const sec = el("section", `an ${k}`);
+    sec.append(el("h5", null, label));
+    const ul = el("ul");
+    x.analysis[k].forEach((item) => ul.append(el("li", null, item)));
+    sec.append(ul);
+    grid.append(sec);
+  }
+  jd.append(grid);
+  box.append(jd);
+  const list = el("div", "repos");
+  x.projects.forEach((p, i) => {
+    const row = el("div", "repo");
+    const sc = x.scores?.[i];
+    const topRow = el("div", "repo-top");
+    const left = el("div", "repo-main");
+    left.append(el("div", "repo-name", `Project ${i + 1}: ${p.title}`), el("div", "repo-desc", p.context));
+    const facts = el("div", "repo-facts");
+    p.tech_stack.forEach((t) => facts.append(el("span", null, t)));
+    left.append(facts);
+    topRow.append(left);
+    if (sc) {
+      const score = el("div", `score${sc.score < x.threshold ? " low" : ""}`);
+      score.append(el("div", "score-v", sc.score.toFixed(2)));
+      const bar = el("div", "score-bar"); const fill = el("div"); fill.style.width = `${Math.round(sc.score * 100)}%`;
+      bar.append(fill); score.append(bar);
+      topRow.append(score);
+    }
+    row.append(topRow);
+    if (sc) {
+      const parts = el("div", "repo-facts");
+      for (const [k, v] of Object.entries(sc.parts)) parts.append(el("span", null, `${k.replace(/_/g, " ")} ${Math.round(v * 100)}%`));
+      if (!sc.credible) parts.append(el("span", null, "credibility cap"));
+      row.append(parts);
+      if (sc.score < x.threshold && sc.feedback) row.append(el("div", "repo-reason", `Feedback: ${sc.feedback}`));
+    }
+    const ul = el("ul", "highlights");
+    p.highlights.forEach((h) => ul.append(el("li", null, h)));
+    row.append(ul);
+    list.append(row);
+  });
+  box.append(list);
+  const rep = x.reply || {};
+  const replyText = { sent: `✓ Sent to #${x.channel} as a reply to job ${x.job_id}`,
+    failed: `✗ Server refused the reply: ${rep.error}`, pending: `Reply waiting: ${rep.error}` }[rep.status] || "Sending reply…";
+  if (x.status === "missed" || rep.status === "sent") box.append(el("div", `reply ${rep.status || "sending"}`, replyText));
+  const key = `compose:${x.job_id}`;
+  const d = el("details", "report");
+  d.open = openRows.has(key);
+  d.addEventListener("toggle", () => { d.open ? openRows.add(key) : openRows.delete(key); });
+  d.append(el("summary", null, "Full missed reply"), el("pre", null, x.text));
+  box.append(d);
   return box;
 }
 

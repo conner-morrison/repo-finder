@@ -74,7 +74,9 @@ with would you your yours need needs needed someone looking want wants help help
 like able using use used new current currently please must also well work working job project expert
 experienced experience developer freelancer etc including include includes based within across ensure first
 goal goals all one two three more most may might every per via just really thing things important ones
-bring cancel main best good great top ready quick asap long term lot lots kind sure""".split())
+bring cancel main best good great top ready quick asap long term lot lots kind sure account accounts
+service services servic create creating creat engaging engag link links product products brand branded
+http https www com upwork jobs job details apply hire hiring budget hourly fixed price""".split())
 
 
 def stem(word):
@@ -101,22 +103,27 @@ def found_terms(lexicon, normed):
     return hits
 
 
+URLISH = re.compile(r"https?://\S+|www\.\S+|[\w.+-]+@[\w-]+\.[\w.-]+")
+
+
 def job_profile(title, description):
     title = re.sub(r"\((re-?run|repost(ed)?|updated?)\)", "", title, flags=re.I).strip()
+    title, description = URLISH.sub(" ", title), URLISH.sub(" ", description or "")
     normed, title_normed = norm(f"{title}\n{description}"), norm(title)
     # A term in the title is what the job is; one only in the description may be
     # incidental (a tool to move away from, say), so the title counts three times.
     weigh = lambda lex: {t: 3 if t in found_terms(lex, title_normed) else 1 for t in found_terms(lex, normed)}
     tech, arch = weigh(TECH), weigh(ARCH)
+    plain = lambda w, s: (s not in STOP and w not in STOP and len(s) > 2 and s.isalpha() and s not in lexical)
     lexical = {stem(w) for phrases in list(TECH.values()) + list(ARCH.values()) for p in phrases for w in words(p)}
     counts = Counter()
     for w in words(description):
         s = stem(w)
-        if s not in STOP and w not in STOP and len(s) > 2 and not s.isdigit() and s not in lexical:
+        if plain(w, s):
             counts[s] += 1
     for w in words(title):
         s = stem(w)
-        if s not in STOP and w not in STOP and len(s) > 2 and not s.isdigit() and s not in lexical:
+        if plain(w, s):
             counts[s] += 3
     keywords = dict(counts.most_common(12))
     by_weight = lambda d: dict(sorted(d.items(), key=lambda kv: -kv[1]))
@@ -129,20 +136,35 @@ def score_repo(profile, repo, readme):
                      readme[:30000]])
     normed = norm(text)
     parts, weights = {}, {"tech": 0.4, "requirements": 0.4, "architecture": 0.2}
-    def covered(weights, lexicon):
-        hit = found_terms({t: lexicon[t] for t in weights}, normed)
-        return sum(w for t, w in weights.items() if t in hit) / sum(weights.values())
+
+    def coverage(terms, hit):
+        """Core terms (named in the title, weight 3) decide the part; terms only in
+        the description (weight 1, often tools being replaced) add at most 15%.
+        A repo that fully covers what the job is about can then reach 1.0."""
+        core = [t for t, w in terms.items() if w >= 3]
+        rest = [t for t, w in terms.items() if w < 3]
+        share = lambda ts: sum(1 for t in ts if hit(t)) / len(ts)
+        if core and rest:
+            return 0.85 * share(core) + 0.15 * share(rest)
+        return share(core or rest)
+
+    def lex_hit(lexicon):
+        return lambda t: bool(found_terms({t: lexicon[t]}, normed))
+
     if profile["tech"]:
-        parts["tech"] = covered(profile["tech"], TECH)
+        parts["tech"] = coverage(profile["tech"], lex_hit(TECH))
     if profile["arch"]:
-        parts["architecture"] = covered(profile["arch"], ARCH)
+        parts["architecture"] = coverage(profile["arch"], lex_hit(ARCH))
     if profile["keywords"]:
-        total = sum(profile["keywords"].values())
-        parts["requirements"] = sum(w for k, w in profile["keywords"].items() if f" {k} " in normed) / total
+        parts["requirements"] = coverage(profile["keywords"], lambda k: f" {k} " in normed)
     if not parts:
         return 0.0, {}
     used = sum(weights[k] for k in parts)
     score = sum(weights[k] * v for k, v in parts.items()) / used
+    if "tech" in parts:
+        # The stack is not interchangeable: missing half of it costs a quarter of
+        # the score, whatever the words say.
+        score *= 0.5 + 0.5 * parts["tech"]
     if not readme.strip():
         score *= 0.85          # we saw less of it, so trust it less
     return round(score, 3), {k: round(v, 2) for k, v in parts.items()}
@@ -181,6 +203,9 @@ def gh(path, params=None, accept="application/vnd.github+json"):
                 reset = int(err.headers.get("X-RateLimit-Reset") or 0)
                 time.sleep(min(max(reset - time.time(), 5), 65))
                 continue
+            if err.code in (500, 502, 503, 504) and attempt < 2:   # GitHub hiccup: back off and retry
+                time.sleep(3 * (attempt + 1))
+                continue
             if err.code == 404:
                 return None
             raise RuntimeError(f"GitHub {err.code} on {path}: {err.read()[:200].decode('utf-8', 'replace')}")
@@ -205,6 +230,10 @@ def queries_for(profile):
     for i, a in enumerate(tech[:3]):
         for b in tech[i + 1:3]:
             out.append(f"{alias[a]} {alias[b]}")
+            if arch:
+                out.append(f"{alias[a]} {alias[b]} {arch[0]}")
+    if "highlevel" in tech[:3]:
+        out.append("ghl " + (arch[0] if arch else "api"))
     for t in tech[:3]:
         for c in (arch[:2] + kw[:1]):
             out.append(f"{alias[t]} {c}")
@@ -216,7 +245,7 @@ def queries_for(profile):
         if q not in seen:
             seen.add(q)
             uniq.append(q)
-    return uniq[:8]
+    return uniq[:12]
 
 
 def month_end(ym):
@@ -230,6 +259,25 @@ def in_period(repo, period):
     start, end = period
     created, pushed = (repo.get("created_at") or "")[:7], (repo.get("pushed_at") or "")[:7]
     return bool(created) and created >= start and (not end or pushed <= end)
+
+
+NOT_A_PROJECT = re.compile(r"portfolio|resume|\bcv\b|personal[-_ ]?(site|page|website)|about[-_ ]?me|"
+                           r"\.github\.io$|^dotfiles$|awesome[-_]", re.I)
+
+
+SPAM = re.compile(r"\breview\b|ranked|\btop \d+|free trial|save up|discount|coupon|promo|affiliate|"
+                  r"best .{0,30}\b20\d\d\b|\bvs\.? |alternatives?\b.*\b20\d\d|unlimited .{0,20}(tools|funnels)|"
+                  r"all-in-one platform", re.I)
+CODE_LANGS_EXCLUDED = {None, "HTML", "CSS", "Markdown", "TeX", "Roff"}
+
+
+def is_project(repo):
+    """A real code project. Profile READMEs, portfolios and SEO pages name every
+    tool there is without using any of them, which fools a word-based score."""
+    owner, name = repo["full_name"].split("/", 1)
+    text = f"{name} {repo.get('description') or ''}"
+    return (name.lower() != owner.lower() and not NOT_A_PROJECT.search(name) and not SPAM.search(text)
+            and repo.get("language") not in CODE_LANGS_EXCLUDED and (repo.get("size") or 0) > 20)
 
 
 def find_similar(title, description, threshold, exclude=(), want=2, period=None, analyze=None, log=lambda *_: None):
@@ -246,15 +294,21 @@ def find_similar(title, description, threshold, exclude=(), want=2, period=None,
     if period:
         window = f" created:>={period[0]}-01" + (f" pushed:<={month_end(period[1])}" if period[1] else "")
     for q in queries_for(profile):
-        data = gh("/search/repositories", {"q": f"{q} fork:false{window}", "per_page": 10}) or {}
-        for rank, r in enumerate(data.get("items", [])):
-            if r["html_url"].lower() in exclude or r.get("archived") or (period and not in_period(r, period)):
+        # Name/description/topics is precise; README adds the repos that name the
+        # products they work with only there.
+        items = []
+        for scope in ("", " in:name,description,topics,readme"):
+            items += (gh("/search/repositories", {"q": f"{q}{scope} fork:false{window}", "per_page": 20}) or {}).get("items", [])[:20]
+        for rank, r in enumerate(items):
+            rank %= 20
+            if (r["html_url"].lower() in exclude or r.get("archived") or not is_project(r)
+                    or (period and not in_period(r, period))):
                 continue
             repos[r["full_name"]] = r
-            hits[r["full_name"]] += 10 - rank       # earlier and more often = more relevant
-        if len(repos) >= 40:
+            hits[r["full_name"]] += 20 - rank       # earlier and more often = more relevant
+        if len(repos) >= 90:
             break
-    shortlist = [name for name, _ in hits.most_common(12)]
+    shortlist = [name for name, _ in hits.most_common(36)]
     log(f"Searched {len(queries_for(profile))} queries, {len(repos)} candidates, reading {len(shortlist)} READMEs")
     scored, readmes = [], {}
     for name in shortlist:
