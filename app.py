@@ -1022,6 +1022,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve():
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("STATE_DIR") and not os.path.ismount(STATE_FILE.parent):
+        print(f" * WARNING: STATE_DIR {STATE_FILE.parent} is not a mounted volume; "
+              "state.json will be lost on every redeploy", flush=True)
     with lock:   # a search cut short by a restart starts again
         for m in STATE["matches"].values():
             if m["status"] in ACTIVE_MATCH:
