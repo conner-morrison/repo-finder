@@ -14,6 +14,11 @@ Python 3.8+ standard library only — nothing to install.
 Open http://127.0.0.1:5000. Debug mode is on by default: verbose logs, the last
 raw server response on the Report tab, and auto-restart when a source file
 changes. `DEBUG=0 python3 app.py` turns it off; `PORT=` / `HOST=` change the address.
+Settings can also go in a `.env` file next to `app.py` (git-ignored).
+
+On a host such as Railway, run with `DEBUG=0` and `HOST=0.0.0.0`. Set `STATE_DIR` to a
+persistent volume (for example `/data`) so `state.json` survives redeploys, and set
+`UI_PASSWORD` so the web UI asks for a password (basic auth, any user name).
 
 GitHub is searched with `GITHUB_TOKEN` (or `GH_TOKEN`), or the token of a
 logged-in `gh` CLI if there is one; without a token it still works, at

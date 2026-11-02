@@ -3,3 +3,4 @@ state.tmp
 __pycache__/
 .deps/
 ai_tasks/
+.env

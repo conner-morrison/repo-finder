@@ -17,6 +17,8 @@ GET .../messages?wait=N once enrolled.
 Standard library only. Run:  python3 app.py        (debug mode is on by default)
 """
 
+import base64
+import hmac
 import json
 import queue
 import re
@@ -34,9 +36,28 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-import ai
-import analyzer
-import finder
+
+def load_env(path=Path(__file__).resolve().parent / ".env"):
+    """KEY=value lines from .env into the environment; a variable already set wins."""
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip("\"'")
+        if value:
+            os.environ.setdefault(key.strip(), value)
+
+
+load_env()
+
+import ai        # noqa: E402
+import analyzer  # noqa: E402
+import finder    # noqa: E402
 
 APP_NAME = "repo-finder"
 HOST = os.environ.get("HOST", "127.0.0.1")
@@ -46,7 +67,10 @@ DEFAULT_SERVER = "https://relay-production-7643.up.railway.app/upwork"
 
 ROOT = Path(__file__).resolve().parent
 STATIC = ROOT / "static"
-STATE_FILE = ROOT / "state.json"
+# STATE_DIR puts state.json on a persistent disk (e.g. a Railway volume)
+STATE_FILE = Path(os.environ.get("STATE_DIR") or ROOT) / "state.json"
+# UI_PASSWORD guards the web UI with HTTP basic auth (any user name) when it is reachable from outside
+UI_PASSWORD = os.environ.get("UI_PASSWORD", "")
 
 LONG_POLL = 25          # seconds the relay may hold a poll open
 MIN_POLL_GAP = 3        # never ask more often than this, even if answered at once
@@ -891,7 +915,26 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return {}
 
+    def authorised(self):
+        """With UI_PASSWORD set, every request needs it as the basic-auth password."""
+        if not UI_PASSWORD:
+            return True
+        scheme, _, given = (self.headers.get("Authorization") or "").partition(" ")
+        try:
+            password = base64.b64decode(given).decode().partition(":")[2]
+        except ValueError:
+            password = ""
+        if scheme.lower() == "basic" and hmac.compare_digest(password.encode(), UI_PASSWORD.encode()):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", f'Basic realm="{APP_NAME}"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
     def do_GET(self):
+        if not self.authorised():
+            return
         if self.path.startswith("/api/state"):
             return self.send_json(public_state())
         name = "index.html" if self.path in ("/", "") else self.path.lstrip("/").split("?")[0]
@@ -908,6 +951,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
+        if not self.authorised():
+            return
         body = self.read_json()
         try:
             if self.path == "/api/register":
